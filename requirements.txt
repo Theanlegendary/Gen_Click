@@ -1,0 +1,7 @@
+google-generativeai==0.5.4
+requests==2.32.3
+python-dotenv==1.0.1
+gradio-client
+moviepy
+edge-tts
+Pillow

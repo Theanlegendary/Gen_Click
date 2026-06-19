@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.pyc
+music/
+short_*/
+story_*/
+*.mp3
+*.mp4
+*.srt
+*.ass
+*.png
+*.jpg
+*.jpeg
+temp_*
