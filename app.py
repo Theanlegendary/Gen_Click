@@ -5,6 +5,8 @@ import json
 import os
 import re
 import socket
+import sys
+import threading
 import traceback
 import uuid
 from pathlib import Path
@@ -227,10 +229,13 @@ def safe_asset_name(filename):
     return f"{int(uuid.uuid4().int % 1_000_000_000)}_{cleaned}{suffix}"
 
 
-def fetch_topic_assets(topic, limit=6):
+def fetch_topic_assets(topic, limit=6, start_offset=0, progress_callback=None):
     topic = topic.strip()
     if not topic:
         raise ValueError("Enter a topic before fetching visuals.")
+
+    if progress_callback:
+        progress_callback(10, "Searching Wikimedia Commons...")
 
     headers = {"User-Agent": "Mozilla/5.0"}
     candidates = []
@@ -240,47 +245,64 @@ def fetch_topic_assets(topic, limit=6):
             "generator": "search",
             "gsrsearch": query,
             "gsrnamespace": "6",
-            "gsrlimit": str(max(limit * 3, 12)),
+            "gsrlimit": "50",
             "prop": "imageinfo",
             "iiprop": "url|mime|size",
             "iiurlwidth": "720",
             "format": "json",
         }
-        response = requests.get(COMMONS_API_URL, params=params, headers=headers, timeout=20)
-        response.raise_for_status()
-        pages = (response.json().get("query") or {}).get("pages", {})
-        for page in pages.values():
-            info = (page.get("imageinfo") or [{}])[0]
-            mime = (info.get("mime") or "").lower()
-            url = info.get("thumburl") or info.get("url")
-            width = int(info.get("width") or 0)
-            height = int(info.get("height") or 0)
-            if url and mime in {"image/jpeg", "image/png"} and width >= 300 and height >= 300:
-                candidates.append(url)
-            if len(candidates) >= limit:
-                break
-        if len(candidates) >= limit:
-            break
+        try:
+            response = requests.get(COMMONS_API_URL, params=params, headers=headers, timeout=20)
+            response.raise_for_status()
+            pages = (response.json().get("query") or {}).get("pages", {})
+            for page in pages.values():
+                info = (page.get("imageinfo") or [{}])[0]
+                mime = (info.get("mime") or "").lower()
+                url = info.get("thumburl") or info.get("url")
+                width = int(info.get("width") or 0)
+                height = int(info.get("height") or 0)
+                if url and mime in {"image/jpeg", "image/png"} and width >= 300 and height >= 300:
+                    if url not in candidates:
+                        candidates.append(url)
+        except Exception:
+            continue
+
+    if progress_callback:
+        progress_callback(30, f"Found {len(candidates)} candidates. Downloading requested batch...")
 
     assets = []
-    for index, url in enumerate(candidates[:limit], start=1):
+    slice_candidates = candidates[start_offset : start_offset + limit]
+    if not slice_candidates:
+        if start_offset > 0:
+            raise ValueError(f"No more visuals found on Wikimedia for '{topic}'. Try a different source.")
+        else:
+            raise ValueError("No downloadable visuals found. Try a more specific topic or upload images.")
+
+    total_to_download = len(slice_candidates)
+    for index, url in enumerate(slice_candidates, start=1):
         suffix = ".jpg" if ".jpg" in url.lower() or ".jpeg" in url.lower() else ".png"
         output_path = ASSET_DIR / f"fetched_{int(uuid.uuid4().int % 1_000_000_000)}_{index}{suffix}"
         try:
             download_image(url, str(output_path), max_retries=1)
             assets.append(register_asset(output_path))
         except Exception:
-            continue
+            pass
+        if progress_callback:
+            pct = 30 + int((index / total_to_download) * 70)
+            progress_callback(pct, f"Downloaded {index}/{total_to_download} visuals...")
 
     if not assets:
         raise ValueError("No downloadable visuals found. Try a more specific topic or upload images.")
     return assets
 
 
-def fetch_pixabay_assets(topic, limit=6):
+def fetch_pixabay_assets(topic, limit=6, start_offset=0, progress_callback=None):
     api_key = os.getenv("PIXABAY_API_KEY")
     if not api_key or api_key.startswith("your_"):
         raise ValueError("PIXABAY_API_KEY is missing in .env.")
+
+    if progress_callback:
+        progress_callback(10, "Searching Pixabay...")
 
     search_query = normalize_topic_for_search(topic)
     exact_topic = " ".join(re.sub(r"[^a-zA-Z0-9\s-]", " ", topic).split()).lower()
@@ -303,14 +325,17 @@ def fetch_pixabay_assets(topic, limit=6):
             "per_page": 50,
             "order": "popular",
         }
-        response = requests.get("https://pixabay.com/api/", params=params, timeout=20)
-        response.raise_for_status()
-        for hit in response.json().get("hits", []):
-            hit_id = hit.get("id")
-            if hit_id in seen_ids:
-                continue
-            seen_ids.add(hit_id)
-            hits.append(hit)
+        try:
+            response = requests.get("https://pixabay.com/api/", params=params, timeout=20)
+            response.raise_for_status()
+            for hit in response.json().get("hits", []):
+                hit_id = hit.get("id")
+                if hit_id in seen_ids:
+                    continue
+                seen_ids.add(hit_id)
+                hits.append(hit)
+        except Exception:
+            continue
 
     relevant_terms = [term for term in search_query.split() if term not in {"space", "astronomy", "cosmos", "universe", "science", "discovery", "documentary"}]
     exact_phrase = " ".join(relevant_terms)
@@ -336,12 +361,22 @@ def fetch_pixabay_assets(topic, limit=6):
         return score
 
     hits = sorted(hits, key=hit_score, reverse=True)
+    if relevant_terms:
+        hits = [hit for hit in hits if hit_score(hit) > 0]
+
+    if progress_callback:
+        progress_callback(30, f"Found {len(hits)} matching visuals. Downloading batch...")
+
+    slice_hits = hits[start_offset : start_offset + limit]
+    if not slice_hits:
+        if start_offset > 0:
+            raise ValueError(f"No more visuals found on Pixabay for '{topic}'. Try a different source.")
+        else:
+            raise ValueError(f"Pixabay did not return relevant images for '{search_query}'. Try AI images or upload your own visuals.")
+
     assets = []
-    for index, hit in enumerate(hits, start=1):
-        if len(assets) >= limit:
-            break
-        if relevant_terms and hit_score(hit) <= 0:
-            continue
+    total_to_download = len(slice_hits)
+    for index, hit in enumerate(slice_hits, start=1):
         url = hit.get("largeImageURL") or hit.get("webformatURL") or hit.get("previewURL")
         if not url:
             continue
@@ -350,16 +385,24 @@ def fetch_pixabay_assets(topic, limit=6):
             download_image(url, str(output_path), max_retries=1)
             assets.append(register_asset(output_path))
         except Exception:
-            continue
+            pass
+        if progress_callback:
+            pct = 30 + int((index / total_to_download) * 70)
+            progress_callback(pct, f"Downloaded {index}/{total_to_download} visuals...")
+
     if not assets:
         raise ValueError(f"Pixabay did not return relevant images for '{search_query}'. Try AI images or upload your own visuals.")
     return assets
 
 
-def generate_ai_assets(topic, limit=6):
+def generate_ai_assets(topic, limit=6, start_offset=0, progress_callback=None):
     topic = topic.strip()
     if not topic:
         raise ValueError("Enter a topic before generating AI images.")
+
+    if progress_callback:
+        progress_callback(10, "Preparing prompts for AI generation...")
+
     search_query = normalize_topic_for_search(topic)
     prompt_templates = [
         "cinematic documentary opening scene about {query}, vertical 9:16, realistic, no text, no watermark",
@@ -370,15 +413,27 @@ def generate_ai_assets(topic, limit=6):
         "epic final discovery shot about {query}, documentary style, vertical 9:16, no text",
     ]
     assets = []
-    for index in range(1, limit + 1):
+    
+    for index in range(start_offset + 1, start_offset + limit + 1):
         template = prompt_templates[(index - 1) % len(prompt_templates)]
         prompt = template.format(topic=topic, query=search_query)
         if index > len(prompt_templates):
             prompt = f"{prompt}, unique variation {index}, different angle, different composition"
         output_path = ASSET_DIR / f"ai_{int(uuid.uuid4().int % 1_000_000_000)}_{index}.jpg"
-        image_url = generate_image(prompt, index)
-        download_image(image_url, str(output_path), max_retries=2)
-        assets.append(register_asset(output_path))
+        
+        if progress_callback:
+            progress_callback(10 + int(((index - start_offset - 1) / limit) * 90), f"Generating AI image {index - start_offset}/{limit}...")
+            
+        try:
+            image_url = generate_image(prompt, index)
+            download_image(image_url, str(output_path), max_retries=2)
+            assets.append(register_asset(output_path))
+        except Exception as e:
+            print(f"Error generating AI image: {e}")
+            continue
+
+    if progress_callback:
+        progress_callback(100, "AI generation complete!")
     return assets
 
 
@@ -394,7 +449,60 @@ def find_free_port(start=7860, attempts=50):
     raise OSError(f"No free local port found from {start} to {start + attempts - 1}.")
 
 
-def run_generation(req):
+TASKS = {}
+
+class TaskLogStream(io.IOBase):
+    def __init__(self, task_id, original_stdout):
+        self.task_id = task_id
+        self.original_stdout = original_stdout
+    def write(self, s):
+        if self.task_id in TASKS:
+            TASKS[self.task_id]["log"] += s
+        self.original_stdout.write(s)
+        self.original_stdout.flush()
+        return len(s)
+
+def update_task_progress(task_id, percent, message, status="running", result=None):
+    if task_id in TASKS:
+        TASKS[task_id]["percent"] = percent
+        TASKS[task_id]["message"] = message
+        TASKS[task_id]["status"] = status
+        if result is not None:
+            TASKS[task_id]["result"] = result
+
+def run_fetch_assets_task(task_id, fetch_func, topic, limit, start_offset):
+    def progress_cb(percent, message):
+        update_task_progress(task_id, percent, message)
+    try:
+        assets = fetch_func(topic, limit, start_offset, progress_callback=progress_cb)
+        update_task_progress(task_id, 100, "Done", status="completed", result={"ok": True, "assets": assets})
+    except Exception as exc:
+        traceback.print_exc()
+        update_task_progress(task_id, 0, str(exc), status="failed")
+
+def run_generation_task(task_id, req):
+    try:
+        output_path, post = run_generation(req, task_id)
+        resolved = Path(output_path).resolve()
+        if not resolved.exists() or ROOT not in resolved.parents:
+            raise ValueError("Generated video path is invalid.")
+        token = uuid.uuid4().hex
+        VIDEO_REGISTRY[token] = str(resolved)
+        
+        result = {
+            "ok": True,
+            "message": f"Generated: {resolved}",
+            "video_url": f"/video/{token}",
+            "post": post,
+            "log": TASKS[task_id]["log"][-8000:]
+        }
+        update_task_progress(task_id, 100, "Done", status="completed", result=result)
+    except Exception as exc:
+        traceback.print_exc()
+        update_task_progress(task_id, 0, str(exc), status="failed")
+
+
+def run_generation(req, task_id):
     topic = req.topic.strip()
     if not topic:
         raise ValueError("Enter a topic first.")
@@ -411,9 +519,12 @@ def run_generation(req):
     shorts_generator.SCENE_COUNT = max(requested_scene_count, len(selected_paths), 3)
     shorts_generator.SELECTED_VISUAL_PATHS = selected_paths
 
-    buffer = io.StringIO()
+    def progress_cb(percent, message):
+        update_task_progress(task_id, percent, message)
+
+    stream = TaskLogStream(task_id, sys.stdout)
     try:
-        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+        with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
             output_path = asyncio.run(
                 shorts_generator.create_shorts_video(
                     topic=topic,
@@ -421,12 +532,13 @@ def run_generation(req):
                     voice_name=req.voice,
                     use_bg_music=req.use_music,
                     subtitle_position=req.subtitle_position,
+                    progress_callback=progress_cb
                 )
             )
     finally:
         shorts_generator.SELECTED_VISUAL_PATHS = []
         shorts_generator.SCENE_COUNT = previous_scene_count
-    return output_path, buffer.getvalue(), build_post_package(topic)
+    return output_path, build_post_package(topic)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -440,28 +552,26 @@ def status():
     return {"ready": ready, "checks": checks}
 
 
+@app.get("/task/{task_id}")
+def get_task_status(task_id: str):
+    task = TASKS.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
+
 @app.post("/generate")
 async def generate(req: GenerateRequest):
-    try:
-        output_path, log, post = await asyncio.to_thread(run_generation, req)
-        resolved = Path(output_path).resolve()
-        if not resolved.exists() or ROOT not in resolved.parents:
-            raise ValueError("Generated video path is invalid.")
-        token = uuid.uuid4().hex
-        VIDEO_REGISTRY[token] = str(resolved)
-        return JSONResponse({
-            "ok": True,
-            "message": f"Generated: {resolved}",
-            "video_url": f"/video/{token}",
-            "post": post,
-            "log": log[-8000:],
-        })
-    except Exception:
-        return JSONResponse({
-            "ok": False,
-            "message": "Generation failed. Check the log.",
-            "log": traceback.format_exc()[-8000:],
-        }, status_code=400)
+    task_id = uuid.uuid4().hex
+    TASKS[task_id] = {
+        "status": "pending",
+        "percent": 0,
+        "message": "Starting video generation...",
+        "log": "",
+        "result": None
+    }
+    threading.Thread(target=run_generation_task, args=(task_id, req), daemon=True).start()
+    return {"ok": True, "task_id": task_id}
 
 
 @app.get("/suggest")
@@ -488,33 +598,48 @@ async def upload_assets(files: list[UploadFile] = File(...)):
 
 
 @app.get("/fetch-assets")
-async def fetch_assets(topic: str, limit: int = 6):
-    try:
-        limit = min(max(int(limit), 3), 15)
-        assets = await asyncio.to_thread(fetch_topic_assets, topic, limit)
-        return {"ok": True, "assets": assets}
-    except Exception as exc:
-        return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
+async def fetch_assets(topic: str, limit: int = 6, start_offset: int = 0):
+    limit = min(max(int(limit), 3), 15)
+    task_id = uuid.uuid4().hex
+    TASKS[task_id] = {
+        "status": "pending",
+        "percent": 0,
+        "message": "Initializing...",
+        "log": "",
+        "result": None
+    }
+    threading.Thread(target=run_fetch_assets_task, args=(task_id, fetch_topic_assets, topic, limit, start_offset), daemon=True).start()
+    return {"ok": True, "task_id": task_id}
 
 
 @app.get("/fetch-pixabay-assets")
-async def fetch_pixabay(topic: str, limit: int = 6):
-    try:
-        limit = min(max(int(limit), 3), 15)
-        assets = await asyncio.to_thread(fetch_pixabay_assets, topic, limit)
-        return {"ok": True, "assets": assets}
-    except Exception as exc:
-        return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
+async def fetch_pixabay(topic: str, limit: int = 6, start_offset: int = 0):
+    limit = min(max(int(limit), 3), 15)
+    task_id = uuid.uuid4().hex
+    TASKS[task_id] = {
+        "status": "pending",
+        "percent": 0,
+        "message": "Initializing...",
+        "log": "",
+        "result": None
+    }
+    threading.Thread(target=run_fetch_assets_task, args=(task_id, fetch_pixabay_assets, topic, limit, start_offset), daemon=True).start()
+    return {"ok": True, "task_id": task_id}
 
 
 @app.get("/generate-ai-assets")
-async def generate_ai(topic: str, limit: int = 6):
-    try:
-        limit = min(max(int(limit), 3), 15)
-        assets = await asyncio.to_thread(generate_ai_assets, topic, limit)
-        return {"ok": True, "assets": assets}
-    except Exception as exc:
-        return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
+async def generate_ai(topic: str, limit: int = 6, start_offset: int = 0):
+    limit = min(max(int(limit), 3), 15)
+    task_id = uuid.uuid4().hex
+    TASKS[task_id] = {
+        "status": "pending",
+        "percent": 0,
+        "message": "Initializing...",
+        "log": "",
+        "result": None
+    }
+    threading.Thread(target=run_fetch_assets_task, args=(task_id, generate_ai_assets, topic, limit, start_offset), daemon=True).start()
+    return {"ok": True, "task_id": task_id}
 
 
 @app.get("/asset/{asset_id}")
@@ -794,6 +919,18 @@ HTML = """
       <button id="generateAiAssets" class="secondary">Generate AI Images</button>
       <button id="fetchPixabayAssets" class="secondary">Fetch From Pixabay</button>
       <button id="fetchAssets" class="secondary">Fetch From Wikimedia</button>
+      <button id="fetchMore" class="secondary" style="display: none; background: #0f766e; font-weight: bold; margin-bottom: 10px;">Fetch More</button>
+
+      <div id="taskProgressContainer" style="display: none; margin: 14px 0; border: 1px solid var(--line); border-radius: 6px; padding: 12px; background: #fdfdfd;">
+        <div style="display: flex; justify-content: space-between; font-size: 13px; font-weight: bold; margin-bottom: 6px;">
+          <span id="taskStatusMessage">Running task...</span>
+          <span id="taskPercentText">0%</span>
+        </div>
+        <div style="width: 100%; height: 8px; background: #e2e2e0; border-radius: 4px; overflow: hidden;">
+          <div id="taskProgressBar" style="width: 0%; height: 100%; background: var(--accent); transition: width 0.3s ease;"></div>
+        </div>
+      </div>
+
       <div id="assets" class="asset-grid"></div>
 
       <button id="generate">Generate Short</button>
@@ -822,9 +959,13 @@ HTML = """
     const generateAiAssets = document.getElementById("generateAiAssets");
     const fetchPixabayAssets = document.getElementById("fetchPixabayAssets");
     const fetchAssets = document.getElementById("fetchAssets");
+    const fetchMore = document.getElementById("fetchMore");
     const assetGrid = document.getElementById("assets");
     let assetList = [];
     let selectedAssetIds = [];
+
+    let lastFetchSource = "";
+    let fetchOffsets = { wikimedia: 0, pixabay: 0, ai: 0 };
 
     function selectedVisualCount() {
       return Number(document.getElementById("visualCount").value || 12);
@@ -884,7 +1025,11 @@ HTML = """
         const data = await res.json();
         if (!data.ok) throw new Error(data.message || "Upload failed.");
         assetList = assetList.concat(data.assets);
-        selectedAssetIds = selectedAssetIds.concat(data.assets.map(asset => asset.id)).slice(0, selectedVisualCount());
+        const remainingSpots = selectedVisualCount() - selectedAssetIds.length;
+        if (remainingSpots > 0) {
+          const newSelected = data.assets.slice(0, remainingSpots).map(asset => asset.id);
+          selectedAssetIds = selectedAssetIds.concat(newSelected);
+        }
         renderAssets();
         result.textContent = `Loaded ${data.assets.length} uploaded visuals. Total: ${assetList.length}.`;
       } catch (err) {
@@ -895,43 +1040,132 @@ HTML = """
       }
     });
 
-    async function loadAssetsFromEndpoint(buttonEl, url, loadingText, doneText) {
+    function pollTask(taskId, onProgress, onSuccess, onFailure) {
+      const interval = setInterval(async () => {
+        try {
+          const res = await fetch(`/task/${taskId}`);
+          if (!res.ok) throw new Error("Status check failed");
+          const data = await res.json();
+          
+          if (data.status === "running" || data.status === "pending") {
+            onProgress(data.percent, data.message, data.log);
+          } else if (data.status === "completed") {
+            clearInterval(interval);
+            onSuccess(data.result);
+          } else if (data.status === "failed") {
+            clearInterval(interval);
+            onFailure(data.message || "Task failed.", data.log);
+          }
+        } catch (err) {
+          clearInterval(interval);
+          onFailure(err.message || String(err));
+        }
+      }, 1000);
+      return interval;
+    }
+
+    async function loadAssetsFromEndpoint(buttonEl, url, sourceKey, loadingText, doneText, isMore = false) {
       const topic = document.getElementById("topic").value.trim();
       if (!topic) {
         result.textContent = "Enter a topic first.";
         return;
       }
+      
+      const currentOffset = isMore ? fetchOffsets[sourceKey] : 0;
+      if (!isMore) {
+        fetchOffsets[sourceKey] = 0;
+      }
+
       buttonEl.disabled = true;
-      buttonEl.textContent = loadingText;
+      fetchMore.disabled = true;
+      
+      const progressContainer = document.getElementById("taskProgressContainer");
+      const statusMsg = document.getElementById("taskStatusMessage");
+      const percentText = document.getElementById("taskPercentText");
+      const progressBar = document.getElementById("taskProgressBar");
+      
+      progressContainer.style.display = "block";
+      statusMsg.textContent = loadingText;
+      percentText.textContent = "0%";
+      progressBar.style.width = "0%";
+
       try {
-        const res = await fetch(url + `?limit=${selectedVisualCount()}&topic=${encodeURIComponent(topic)}`);
-        const data = await res.json();
-        if (!data.ok) throw new Error(data.message || "Visual fetch failed.");
-        assetList = assetList.concat(data.assets);
-        const newSelected = data.assets.map(asset => asset.id);
-        selectedAssetIds = selectedAssetIds.concat(newSelected).slice(0, selectedVisualCount());
-        renderAssets();
-        result.textContent = `${doneText}: ${data.assets.length} new visuals loaded. Total: ${assetList.length}.`;
+        const queryUrl = url + `?limit=6&start_offset=${currentOffset}&topic=${encodeURIComponent(topic)}`;
+        const startRes = await fetch(queryUrl);
+        const startData = await startRes.json();
+        if (!startRes.ok || !startData.ok) {
+          throw new Error(startData.message || "Failed to start task.");
+        }
+
+        const taskId = startData.task_id;
+        pollTask(taskId, 
+          (percent, msg) => {
+            statusMsg.textContent = msg;
+            percentText.textContent = percent + "%";
+            progressBar.style.width = percent + "%";
+          },
+          (resData) => {
+            progressContainer.style.display = "none";
+            buttonEl.disabled = false;
+            fetchMore.disabled = false;
+            
+            if (resData.assets && resData.assets.length > 0) {
+              assetList = assetList.concat(resData.assets);
+              const remainingSpots = selectedVisualCount() - selectedAssetIds.length;
+              if (remainingSpots > 0) {
+                const newSelected = resData.assets.slice(0, remainingSpots).map(asset => asset.id);
+                selectedAssetIds = selectedAssetIds.concat(newSelected);
+              }
+              
+              fetchOffsets[sourceKey] += resData.assets.length;
+              lastFetchSource = sourceKey;
+              
+              renderAssets();
+              result.textContent = `${doneText}: ${resData.assets.length} new visuals loaded. Total: ${assetList.length}.`;
+              fetchMore.style.display = "block";
+              fetchMore.textContent = `Fetch More (${sourceKey.toUpperCase()})`;
+            } else {
+              result.textContent = "No assets returned.";
+            }
+          },
+          (errMsg) => {
+            progressContainer.style.display = "none";
+            buttonEl.disabled = false;
+            fetchMore.disabled = false;
+            result.textContent = "Error: " + errMsg;
+          }
+        );
       } catch (err) {
-        result.textContent = String(err);
-      } finally {
+        progressContainer.style.display = "none";
         buttonEl.disabled = false;
+        fetchMore.disabled = false;
+        result.textContent = String(err);
       }
     }
 
     generateAiAssets.addEventListener("click", async () => {
-      await loadAssetsFromEndpoint(generateAiAssets, "/generate-ai-assets", "Generating AI images...", "AI images ready");
+      await loadAssetsFromEndpoint(generateAiAssets, "/generate-ai-assets", "ai", "Generating AI images...", "AI images ready");
       generateAiAssets.textContent = "Generate AI Images";
     });
 
     fetchPixabayAssets.addEventListener("click", async () => {
-      await loadAssetsFromEndpoint(fetchPixabayAssets, "/fetch-pixabay-assets", "Fetching Pixabay...", "Pixabay visuals ready");
+      await loadAssetsFromEndpoint(fetchPixabayAssets, "/fetch-pixabay-assets", "pixabay", "Fetching Pixabay...", "Pixabay visuals ready");
       fetchPixabayAssets.textContent = "Fetch From Pixabay";
     });
 
     fetchAssets.addEventListener("click", async () => {
-      await loadAssetsFromEndpoint(fetchAssets, "/fetch-assets", "Fetching Wikimedia...", "Wikimedia visuals ready");
+      await loadAssetsFromEndpoint(fetchAssets, "/fetch-assets", "wikimedia", "Fetching Wikimedia...", "Wikimedia visuals ready");
       fetchAssets.textContent = "Fetch From Wikimedia";
+    });
+
+    fetchMore.addEventListener("click", () => {
+      if (lastFetchSource === "wikimedia") {
+        loadAssetsFromEndpoint(fetchAssets, "/fetch-assets", "wikimedia", "Fetching more Wikimedia...", "Wikimedia visuals ready", true);
+      } else if (lastFetchSource === "pixabay") {
+        loadAssetsFromEndpoint(fetchPixabayAssets, "/fetch-pixabay-assets", "pixabay", "Fetching more Pixabay...", "Pixabay visuals ready", true);
+      } else if (lastFetchSource === "ai") {
+        loadAssetsFromEndpoint(generateAiAssets, "/generate-ai-assets", "ai", "Generating more AI images...", "AI images ready", true);
+      }
     });
 
     suggest.addEventListener("click", async () => {
@@ -959,6 +1193,16 @@ HTML = """
       post.textContent = "Waiting for post text...";
       video.removeAttribute("src");
 
+      const progressContainer = document.getElementById("taskProgressContainer");
+      const statusMsg = document.getElementById("taskStatusMessage");
+      const percentText = document.getElementById("taskPercentText");
+      const progressBar = document.getElementById("taskProgressBar");
+      
+      progressContainer.style.display = "block";
+      statusMsg.textContent = "Starting video generation...";
+      percentText.textContent = "0%";
+      progressBar.style.width = "0%";
+
       try {
         const res = await fetch("/generate", {
           method: "POST",
@@ -974,21 +1218,57 @@ HTML = """
           })
         });
         const data = await res.json();
-        result.textContent = data.message;
-        log.textContent = data.log || "";
-        if (data.post) {
-          post.textContent = `Title: ${data.post.title}\n\nDescription:\n${data.post.description}\n\nHashtags:\n${data.post.hashtags}`;
+        if (!res.ok || !data.ok) {
+          throw new Error(data.message || "Failed to start generation.");
         }
-        if (data.ok && data.video_url) {
-          video.src = data.video_url;
-          video.load();
-        }
+
+        const taskId = data.task_id;
+        pollTask(taskId,
+          (percent, msg, taskLog) => {
+            statusMsg.textContent = msg;
+            percentText.textContent = percent + "%";
+            progressBar.style.width = percent + "%";
+            if (taskLog) {
+              log.textContent = taskLog;
+              log.scrollTop = log.scrollHeight;
+            }
+          },
+          (resData) => {
+            progressContainer.style.display = "none";
+            button.disabled = false;
+            button.textContent = "Generate Short";
+            
+            result.textContent = resData.message;
+            if (resData.log) {
+              log.textContent = resData.log;
+              log.scrollTop = log.scrollHeight;
+            }
+            if (resData.post) {
+              post.textContent = `Title: ${resData.post.title}\n\nDescription:\n${resData.post.description}\n\nHashtags:\n${resData.post.hashtags}`;
+            }
+            if (resData.video_url) {
+              video.src = resData.video_url;
+              video.load();
+            }
+          },
+          (errMsg, taskLog) => {
+            progressContainer.style.display = "none";
+            button.disabled = false;
+            button.textContent = "Generate Short";
+            result.textContent = "Generation failed.";
+            if (taskLog) {
+              log.textContent = taskLog;
+            } else {
+              log.textContent = errMsg;
+            }
+          }
+        );
       } catch (err) {
-        result.textContent = "Request failed.";
-        log.textContent = String(err);
-      } finally {
+        progressContainer.style.display = "none";
         button.disabled = false;
         button.textContent = "Generate Short";
+        result.textContent = "Request failed.";
+        log.textContent = String(err);
       }
     });
 

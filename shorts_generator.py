@@ -24,6 +24,25 @@ else:
 
 from PIL import Image
 from moviepy import ImageClip, AudioFileClip, CompositeVideoClip, CompositeAudioClip, VideoFileClip
+from proglog import ProgressBarLogger
+
+class MoviePyProgressLogger(ProgressBarLogger):
+    def __init__(self, progress_callback, start_pct=65, end_pct=95):
+        super().__init__(init_state=None, bars=None, logged_bars='all', min_time_interval=0.5)
+        self.progress_callback = progress_callback
+        self.start_pct = start_pct
+        self.end_pct = end_pct
+
+    def callback(self, **changes):
+        pass
+
+    def bars_callback(self, bar, attr, value, old_value=None):
+        total = self.bars[bar].get('total')
+        if total and total > 0:
+            fraction = value / total
+            pct = self.start_pct + int(fraction * (self.end_pct - self.start_pct))
+            if self.progress_callback:
+                self.progress_callback(pct, f"Rendering video ({int(fraction * 100)}%)...")
 
 # Import our custom utilities
 import audio_utils
@@ -545,7 +564,7 @@ def create_scene_image(topic, seg, idx, total_segments, folder_name):
         if os.path.exists(temp_img_path):
             os.remove(temp_img_path)
 
-async def create_shorts_video(topic, voice_name="male", use_bg_music=True, max_duration=TARGET_SHORT_DURATION, subtitle_position="middle", manual_script=""):
+async def create_shorts_video(topic, voice_name="male", use_bg_music=True, max_duration=TARGET_SHORT_DURATION, subtitle_position="middle", manual_script="", progress_callback=None):
     max_duration = TARGET_SHORT_DURATION
     
     print("\n" + "="*50)
@@ -554,6 +573,8 @@ async def create_shorts_video(topic, voice_name="male", use_bg_music=True, max_d
     print("="*50)
     
     # 1. Generate script & scene prompts
+    if progress_callback:
+        progress_callback(5, "Generating script and storyboard...")
     if manual_script.strip():
         print("\n1. Using manual voiceover script...")
         segments = normalize_segment_count(build_manual_segments(manual_script.strip(), topic), SCENE_COUNT)
@@ -571,6 +592,8 @@ async def create_shorts_video(topic, voice_name="male", use_bg_music=True, max_d
     print(f"\nFull Script ({len(full_script.split())} words):\n{full_script}\n")
     
     # 2. Generate Audio & Subtitles
+    if progress_callback:
+        progress_callback(15, "Synthesizing voiceover and extracting word boundaries...")
     print("2. Synthesizing voiceover and extracting word boundaries...")
     audio_path = os.path.join(folder_name, "voiceover.mp3")
     srt_path = await audio_utils.generate_speech_and_srt(full_script, audio_path, voice_name, rate=VOICE_RATE)
@@ -594,9 +617,14 @@ async def create_shorts_video(topic, voice_name="male", use_bg_music=True, max_d
     for idx, seg in enumerate(aligned_segments):
         if idx > 0:
             time.sleep(0.5)
+        if progress_callback:
+            pct = 20 + int((idx / len(aligned_segments)) * 35)
+            progress_callback(pct, f"Preparing scene {idx+1}/{len(aligned_segments)}...")
         processed_images[idx] = create_scene_image(topic, seg, idx, len(aligned_segments), folder_name)
             
     # 4. Create Video Slideshow Clips
+    if progress_callback:
+        progress_callback(58, "Assembling background video clips...")
     print("\n4. Assembling background video clips...")
     image_clips = []
     for idx, seg in enumerate(aligned_segments):
@@ -607,12 +635,16 @@ async def create_shorts_video(topic, voice_name="male", use_bg_music=True, max_d
     background_video = CompositeVideoClip(image_clips, size=(VIDEO_WIDTH, VIDEO_HEIGHT)).with_duration(video_duration)
     
     # 5. Create Subtitles using ASS
+    if progress_callback:
+        progress_callback(60, "Generating dynamic ASS subtitles...")
     print("\n5. Generating dynamic ASS subtitles...")
     grouped_captions = subtitle_utils.group_words(words, max_chars=28, max_words=6)
     ass_path = os.path.join(folder_name, "subtitles.ass")
     subtitle_utils.generate_ass_file(words, grouped_captions, ass_path, position=subtitle_position)
     
     # 6. Setup Audio Track
+    if progress_callback:
+        progress_callback(62, "Mixing narration audio and background music...")
     print("\n6. Mixing narration audio and background music...")
     raw_voice_audio = AudioFileClip(audio_path)
     voice_audio = raw_voice_audio.with_speed_scaled(factor=speed_factor) if speed_factor > 1.0 else raw_voice_audio
@@ -638,11 +670,14 @@ async def create_shorts_video(topic, voice_name="male", use_bg_music=True, max_d
     composite_audio = CompositeAudioClip(audio_clips).with_duration(video_duration)
     
     # 7. Compile Clean Video slideshow (extremely fast without subtitle overlay processing)
+    if progress_callback:
+        progress_callback(65, "Rendering clean video slideshow...")
     print("\n7. Rendering clean video slideshow (MoviePy)...")
     temp_clean_video_path = os.path.join(folder_name, "temp_clean_video.mp4")
     
     background_video = background_video.with_audio(composite_audio)
     
+    moviepy_logger = MoviePyProgressLogger(progress_callback, start_pct=65, end_pct=95) if progress_callback else None
     background_video.write_videofile(
         temp_clean_video_path,
         fps=RENDER_FPS,
@@ -652,7 +687,7 @@ async def create_shorts_video(topic, voice_name="male", use_bg_music=True, max_d
         threads=os.cpu_count() or 4,
         audio_bitrate="128k",
         pixel_format="yuv420p",
-        logger=None  # Suppress verbose MoviePy output
+        logger=moviepy_logger
     )
     
     # Close MoviePy resources before FFmpeg processing to release file locks
@@ -665,6 +700,8 @@ async def create_shorts_video(topic, voice_name="male", use_bg_music=True, max_d
     background_video.close()
 
     # 8. Burn subtitles using native FFmpeg
+    if progress_callback:
+        progress_callback(96, "Burning dynamic active-word subtitles (native FFmpeg)...")
     print("\n8. Burning dynamic active-word subtitles (native FFmpeg)...")
     output_video_path = os.path.join(folder_name, "final_shorts.mp4")
     
@@ -707,6 +744,8 @@ async def create_shorts_video(topic, voice_name="male", use_bg_music=True, max_d
     except Exception as clean_err:
         print(f"   [Warning] Failed to clean up workspace folder {folder_name}: {clean_err}")
 
+    if progress_callback:
+        progress_callback(100, "Done!")
     print("\n" + "="*50)
     print("  [SUCCESS] YOUTUBE SHORT VIDEO GENERATED SUCCESSFULLY!")
     print(f"  Saved video path: {final_output_path}")
