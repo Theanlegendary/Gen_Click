@@ -1,0 +1,17 @@
+.env
+.DS_Store
+__pycache__/
+*.pyc
+music/
+selected_assets/
+short_*/
+story_*/
+final_short_*.mp4
+*.mp3
+*.mp4
+*.srt
+*.ass
+*.png
+*.jpg
+*.jpeg
+temp_*
