@@ -137,6 +137,26 @@ def normalize_segment_count(segments, target_count):
 
     return segments
 
+def build_manual_segments(manual_script, topic):
+    words = manual_script.split()
+    if not words:
+        return []
+
+    target_count = max(3, min(SCENE_COUNT, 15))
+    chunk_size = max(1, len(words) // target_count)
+    segments = []
+    for idx in range(target_count):
+        start = idx * chunk_size
+        end = len(words) if idx == target_count - 1 else (idx + 1) * chunk_size
+        chunk = " ".join(words[start:end]).strip()
+        if not chunk:
+            continue
+        segments.append({
+            "speech": chunk,
+            "scene_prompt": f"{topic}, documentary visual for this narration: {chunk[:120]}, vertical 9:16, cinematic, no text, no watermark",
+        })
+    return segments
+
 def build_fallback_segments(topic):
     lower_topic = topic.lower()
     if "ocean" in lower_topic and ("sunlight" in lower_topic or "zone" in lower_topic):
@@ -525,7 +545,7 @@ def create_scene_image(topic, seg, idx, total_segments, folder_name):
         if os.path.exists(temp_img_path):
             os.remove(temp_img_path)
 
-async def create_shorts_video(topic, voice_name="male", use_bg_music=True, max_duration=TARGET_SHORT_DURATION, subtitle_position="middle"):
+async def create_shorts_video(topic, voice_name="male", use_bg_music=True, max_duration=TARGET_SHORT_DURATION, subtitle_position="middle", manual_script=""):
     max_duration = TARGET_SHORT_DURATION
     
     print("\n" + "="*50)
@@ -534,7 +554,11 @@ async def create_shorts_video(topic, voice_name="male", use_bg_music=True, max_d
     print("="*50)
     
     # 1. Generate script & scene prompts
-    segments = normalize_segment_count(generate_script_and_storyboard(topic, max_duration), SCENE_COUNT)
+    if manual_script.strip():
+        print("\n1. Using manual voiceover script...")
+        segments = normalize_segment_count(build_manual_segments(manual_script.strip(), topic), SCENE_COUNT)
+    else:
+        segments = normalize_segment_count(generate_script_and_storyboard(topic, max_duration), SCENE_COUNT)
     
     # Create story workspace directory
     clean_topic = "".join([c if c.isalnum() else "_" for c in topic]).strip("_")[:20]

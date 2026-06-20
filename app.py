@@ -34,6 +34,7 @@ app = FastAPI(title="Gen Click Shorts Studio")
 
 class GenerateRequest(BaseModel):
     topic: str
+    manual_script: str = ""
     voice: str = "male"
     use_music: bool = False
     visual_count: int = 12
@@ -82,6 +83,7 @@ def infer_search_extra(topic):
 
 
 def normalize_topic_for_search(topic):
+    original_text = topic.lower()
     text = topic.lower()
     text = re.sub(r"\b\d+\b", " ", text)
     text = re.sub(r"\b(facts?|things?|about|why|how|what|top|amazing|unknown|secret|secrets|mind|blowing|video|shorts?|scientists?|science|found|find|discovered?|tist)\b", " ", text)
@@ -93,6 +95,10 @@ def normalize_topic_for_search(topic):
 
     if "black hole" in query or "black holes" in query or "blackhole" in query or "blackholes" in query:
         query = "black hole space astronomy"
+    elif "nikola tesla" in original_text or "niko tesla" in original_text:
+        query = "nikola tesla"
+    elif len(words) == 2 and all(word[:1].isalpha() for word in words):
+        query = " ".join(words)
     elif query:
         query = f"{query} {search_extra}".strip()
     else:
@@ -277,9 +283,14 @@ def fetch_pixabay_assets(topic, limit=6):
         raise ValueError("PIXABAY_API_KEY is missing in .env.")
 
     search_query = normalize_topic_for_search(topic)
+    exact_topic = " ".join(re.sub(r"[^a-zA-Z0-9\s-]", " ", topic).split()).lower()
     search_queries = [search_query]
+    if exact_topic and exact_topic not in search_queries:
+        search_queries.insert(0, exact_topic)
     if "black hole" in search_query:
         search_queries.extend(["black holes", "black hole universe", "space black hole"])
+    if "nikola tesla" in search_query:
+        search_queries.extend(["nikola tesla", "tesla inventor"])
 
     hits = []
     seen_ids = set()
@@ -301,7 +312,8 @@ def fetch_pixabay_assets(topic, limit=6):
             seen_ids.add(hit_id)
             hits.append(hit)
 
-    relevant_terms = [term for term in search_query.split() if term not in {"space", "astronomy", "cosmos", "universe"}]
+    relevant_terms = [term for term in search_query.split() if term not in {"space", "astronomy", "cosmos", "universe", "science", "discovery", "documentary"}]
+    exact_phrase = " ".join(relevant_terms)
 
     def hit_score(hit):
         haystack = " ".join([
@@ -313,8 +325,12 @@ def fetch_pixabay_assets(topic, limit=6):
         for term in relevant_terms:
             if term in haystack:
                 score += 3
+        if exact_phrase and exact_phrase in haystack:
+            score += 12
         if "black hole" in search_query and "black hole" in haystack:
             score += 10
+        if "nikola tesla" in search_query and "nikola tesla" in haystack:
+            score += 15
         score += int(hit.get("likes") or 0) / 100
         score += int(hit.get("downloads") or 0) / 10000
         return score
@@ -401,6 +417,7 @@ def run_generation(req):
             output_path = asyncio.run(
                 shorts_generator.create_shorts_video(
                     topic=topic,
+                    manual_script=req.manual_script,
                     voice_name=req.voice,
                     use_bg_music=req.use_music,
                     subtitle_position=req.subtitle_position,
@@ -730,6 +747,9 @@ HTML = """
       <textarea id="topic" placeholder="Example: why deserts can suddenly bloom with flowers"></textarea>
       <button id="suggest" class="secondary">Suggest Write</button>
 
+      <label for="manualScript">Manual Voiceover Script (optional)</label>
+      <textarea id="manualScript" placeholder="Write your own narration here. If filled, the tool reads this instead of writing a script."></textarea>
+
       <div class="row">
         <div>
           <label for="voice">Voice</label>
@@ -863,10 +883,10 @@ HTML = """
         const res = await fetch("/upload-assets", {method: "POST", body: form});
         const data = await res.json();
         if (!data.ok) throw new Error(data.message || "Upload failed.");
-        assetList = data.assets;
-        selectedAssetIds = assetList.map(asset => asset.id).slice(0, selectedVisualCount());
+        assetList = assetList.concat(data.assets);
+        selectedAssetIds = selectedAssetIds.concat(data.assets.map(asset => asset.id)).slice(0, selectedVisualCount());
         renderAssets();
-        result.textContent = `Loaded ${assetList.length} uploaded visuals.`;
+        result.textContent = `Loaded ${data.assets.length} uploaded visuals. Total: ${assetList.length}.`;
       } catch (err) {
         result.textContent = String(err);
       } finally {
@@ -887,10 +907,11 @@ HTML = """
         const res = await fetch(url + `?limit=${selectedVisualCount()}&topic=${encodeURIComponent(topic)}`);
         const data = await res.json();
         if (!data.ok) throw new Error(data.message || "Visual fetch failed.");
-        assetList = data.assets;
-        selectedAssetIds = assetList.map(asset => asset.id).slice(0, selectedVisualCount());
+        assetList = assetList.concat(data.assets);
+        const newSelected = data.assets.map(asset => asset.id);
+        selectedAssetIds = selectedAssetIds.concat(newSelected).slice(0, selectedVisualCount());
         renderAssets();
-        result.textContent = `${doneText}: ${assetList.length} visuals loaded.`;
+        result.textContent = `${doneText}: ${data.assets.length} new visuals loaded. Total: ${assetList.length}.`;
       } catch (err) {
         result.textContent = String(err);
       } finally {
@@ -944,6 +965,7 @@ HTML = """
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify({
             topic: document.getElementById("topic").value,
+            manual_script: document.getElementById("manualScript").value,
             voice: document.getElementById("voice").value,
             use_music: document.getElementById("music").checked,
             visual_count: selectedVisualCount(),
